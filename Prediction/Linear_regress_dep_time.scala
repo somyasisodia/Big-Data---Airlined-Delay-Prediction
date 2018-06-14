@@ -1,0 +1,129 @@
+
+import org.apache.spark.rdd._
+
+
+import scala.collection.JavaConverters._
+import au.com.bytecode.opencsv.CSVReader
+import org.apache.spark.SparkContext
+import org.apache.spark.SparkConf
+import java.io._
+import org.joda.time._
+import org.joda.time.format._
+
+
+import org.apache.spark.mllib.regression.LabeledPoint
+import org.apache.spark.mllib.linalg.Vectors
+import org.apache.spark.mllib.feature.StandardScaler
+import org.apache.spark.mllib.classification.LogisticRegressionWithSGD
+import org.apache.spark.mllib.regression.LinearRegressionModel
+import org.apache.spark.mllib.regression.LinearRegressionWithSGD
+
+import org.apache.spark.mllib.evaluation.BinaryClassificationMetrics
+import org.apache.spark.mllib.evaluation.MulticlassMetrics
+
+object linearreg extends App{
+  
+ val conf = new SparkConf().setAppName("Airline delay predection").setMaster("local[2]").set("spark.executor.memory","1g");
+val sc = new SparkContext(conf)
+case class FlightDelay(year: String,
+                    month: String,
+                    dayOfMonth: String,
+                    dayOfWeek: String,
+                    crsDepTime: String,
+                    depDelay: String,
+                    origin: String,
+                    distance: String,
+                    cancelled: String) {
+
+    
+    def feature_details: (String, Array[Double]) = {
+      val values = Array(
+        depDelay.toDouble,
+        month.toDouble,
+        dayOfMonth.toDouble,
+        dayOfWeek.toDouble,
+        get_hour(crsDepTime).toDouble,
+        distance.toDouble
+        
+      )
+      new Tuple2(get_date(year.toInt, month.toInt, dayOfMonth.toInt), values)
+    }
+
+    def get_hour(depTime: String) : String = "%04d".format(depTime.toInt).take(2)
+    def get_date(year: Int, month: Int, day: Int) = "%04d%02d%02d".format(year, month, day)
+
+  }
+
+// function to do a preprocessing step for a given file
+def prepFlightDelays(infile: String): RDD[FlightDelay] = {
+    val data = sc.textFile(infile)
+
+    data.map { line =>
+      val reader = new CSVReader(new StringReader(line))
+      reader.readAll().asScala.toList.map(rec => FlightDelay(rec(1),rec(2),rec(3),rec(4),rec(6),rec(7),rec(5),rec(9),rec(8)))
+    }.map(list => list(0))
+    .filter(rec => rec.year != "Year")
+    .filter(rec => rec.cancelled == "0")
+   .filter(rec => rec.origin == "DFW")
+}
+
+val data_1415 = prepFlightDelays("airline/Dataset1415.csv").map(rec => rec.feature_details._2)
+val data_2016 = prepFlightDelays("airline/Dataset2016.csv").map(rec => rec.feature_details._2)
+data_1415.take(5).map(x => x mkString ",").foreach(println)
+
+def parseData(vals: Array[Double]): LabeledPoint = {
+  LabeledPoint(if (vals(0)>=15) 1.0 else 0.0, Vectors.dense(vals.drop(1)))
+}
+
+// Prepare training set
+val parsedTrainingData = data_1415.map(parseData)
+parsedTrainingData.cache
+val scaler = new StandardScaler(withMean = true, withStd = true).fit(parsedTrainingData.map(x => x.features))
+val scaledTrainingData = parsedTrainingData.map(x => LabeledPoint(x.label, scaler.transform(Vectors.dense(x.features.toArray))))
+scaledTrainingData.cache
+
+// Prepare test/validation set
+val parsedTestingData = data_2016.map(parseData)
+parsedTestingData.cache
+val scaledTestingData = parsedTestingData.map(x => LabeledPoint(x.label, scaler.transform(Vectors.dense(x.features.toArray))))
+scaledTestingData.cache
+
+scaledTrainingData.take(3).map(x => (x.label, x.features)).foreach(println)
+def metricsToEvaluate(labelsPrediction: RDD[(Double, Double)]) : Tuple2[Array[Double], Array[Double]] = {
+    val tp = labelsPrediction.filter(r => r._1==1 && r._2==1).count.toDouble
+    val tn = labelsPrediction.filter(r => r._1==0 && r._2==0).count.toDouble
+    val fp = labelsPrediction.filter(r => r._1==1 && r._2==0).count.toDouble
+    val fn = labelsPrediction.filter(r => r._1==0 && r._2==1).count.toDouble
+
+    val precision = tp / (tp+fp)
+    val recall = tp / (tp+fn)
+    val F_measure = 2*precision*recall / (precision+recall)
+    val accuracy = (tp+tn) / (tp+tn+fp+fn)
+    new Tuple2(Array(tp, tn, fp, fn), Array(precision, recall, F_measure, accuracy))
+}
+val numIterations = 100
+val stepSize = 0.00000001
+val model = LinearRegressionWithSGD.train(scaledTrainingData, numIterations, stepSize)
+
+// Evaluate model on training examples and compute training error
+val valuesAndPreds = scaledTrainingData.map { point =>
+  val prediction = model.predict(point.features)
+  (point.label, prediction)
+  //(point.label, point.features, prediction)
+}
+
+val valuesAndPreds1 = scaledTrainingData.map { point =>
+  val prediction = model.predict(point.features)
+  //(point.label, prediction)
+  (point.label, point.features, prediction)
+}
+val MSE = valuesAndPreds.map{ case(v, p) => math.pow((v - p), 2) }.mean()
+println("training Mean Squared Error = " + MSE)
+
+
+
+valuesAndPreds1.take(10).foreach({case (v, f, p) => 
+     println(s"Features: ${f}, Predicted: ${p}, Actual: ${v}")})
+
+  
+}
